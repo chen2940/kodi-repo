@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Adapt the mirror manifests to the latest stable Kodi release."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+import gzip
+import hashlib
+from http.client import HTTPException
+import io
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+import xml.etree.ElementTree as ET
+import zlib
+
+from addons_xml_generator import ROOT, build, load_manifests, parse_manifest, version_tuple
+
+
+RELEASE_API = 'https://api.github.com/repos/xbmc/xbmc/releases/latest'
+UPSTREAM_FILES = 'https://raw.githubusercontent.com/xbmc/xbmc'
+REPO_POINT = "extension[@point='xbmc.addon.repository']"
+INDEX_LIMIT = 8 * 1024 * 1024
+XML_LIMIT = 48 * 1024 * 1024
+
+
+class HTTPSRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlsplit(newurl).scheme != 'https':
+            raise URLError('redirect to a non-HTTPS URL')
+        if req.has_header('Authorization') and urlsplit(newurl).netloc != urlsplit(req.full_url).netloc:
+            raise URLError('authenticated redirect to another host')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download(url, limit, *, headers=None):
+    if urlsplit(url).scheme != 'https':
+        raise ValueError(f'Expected an HTTPS URL: {url}')
+    request = Request(url, headers={'User-Agent': 'Kodi-mirror-repository-sync', **(headers or {})})
+    opener = build_opener(HTTPSRedirectHandler())
+    for attempt in range(2):
+        try:
+            with opener.open(request, timeout=10) as response:
+                data = response.read(limit + 1)
+            break
+        except HTTPError as error:
+            if attempt or (error.code != 429 and not 500 <= error.code < 600):
+                raise
+        except (OSError, HTTPException) as error:
+            if attempt:
+                raise URLError(f'{url}: {error}') from error
+        time.sleep(0.5)
+    if len(data) > limit:
+        raise ValueError(f'Response exceeds {limit} bytes')
+    return data
+
+
+@dataclass(frozen=True)
+class Release:
+    tag: str
+    api: str
+    series: str
+    index_name: str
+
+
+def fetch_latest_release(token=None):
+    headers = {'Accept': 'application/vnd.github+json'}
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    try:
+        release_data = download(RELEASE_API, 512 * 1024, headers=headers)
+    except HTTPError as error:
+        if not token or error.code not in (401, 403, 404):
+            raise
+        headers.pop('Authorization')
+        release_data = download(RELEASE_API, 512 * 1024, headers=headers)
+    release = json.loads(release_data)
+    tag = release.get('tag_name', '')
+    if (release.get('draft') is not False or release.get('prerelease') is not False
+            or not re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?-[A-Za-z0-9]+', tag)):
+        raise ValueError(f'Unexpected stable Kodi release: {tag!r}')
+    upstream = f'{UPSTREAM_FILES}/{quote(tag, safe="")}'
+    version_txt = download(f'{upstream}/version.txt', 32 * 1024).decode('utf-8')
+    api_line = re.search(r'^ADDON_API[ \t]+([^\s]+)[ \t]*\r?$', version_txt, re.MULTILINE)
+    if api_line is None:
+        raise ValueError(f'{tag}: ADDON_API is missing from version.txt')
+    api = api_line.group(1)
+    version_tuple(api)
+
+    repo_xml = download(f'{upstream}/addons/repository.xbmc.org/addon.xml', 256 * 1024)
+    dirs = ET.fromstring(repo_xml).findall(f'{REPO_POINT}/dir')
+    if len(dirs) != 1:
+        raise ValueError(f'{tag}: expected one upstream repository directory, got {len(dirs)}')
+    datadir = dirs[0].findtext('datadir', '').rstrip('/')
+    info = dirs[0].findtext('info', '')
+    match = re.fullmatch(r'https://mirrors\.kodi\.tv/addons/([a-z0-9-]+)', datadir)
+    if not match or info != f'{datadir}/addons.xml.gz':
+        raise ValueError(f'{tag}: unsupported upstream repository layout ({datadir}, {info})')
+    return Release(tag, api, match.group(1), 'addons.xml.gz')
+
+
+def latest_directory(addon):
+    return max(addon.findall(f'{REPO_POINT}/dir'), key=lambda d: version_tuple(d.attrib['maxversion']))
+
+
+def mirror_urls(addon, release):
+    previous = latest_directory(addon).findtext('datadir').rstrip('/')
+    datadir = f'{previous.rsplit("/", 1)[0]}/{release.series}'
+    return datadir, f'{datadir}/{release.index_name}'
+
+
+@dataclass(frozen=True)
+class MirrorResult:
+    datadir: str
+    info: str
+    checksum: str | None = None
+    verify: str | None = None
+    error: str | None = None
+
+
+def probe_mirror(datadir, info, existing_checksum=None):
+    try:
+        compressed = download(info, INDEX_LIMIT)
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
+            xml = stream.read(XML_LIMIT + 1)
+        if len(xml) > XML_LIMIT:
+            raise ValueError('uncompressed index exceeds size limit')
+        index = ET.fromstring(xml)
+        if index.tag != 'addons' or not any(a.get('id') and a.get('version') for a in index.findall('addon')):
+            raise ValueError('index does not contain Kodi add-ons')
+
+        digest = hashlib.sha256(compressed).hexdigest().encode('ascii')
+        mismatch = False
+        sources = dict.fromkeys(filter(None, (existing_checksum, f'{info}?sha256', f'{info}.sha256')))
+        for url in sources:
+            try:
+                checksum = download(url, 512).strip().split(maxsplit=1)
+            except (OSError, ValueError):
+                continue
+            if checksum and re.fullmatch(rb'[0-9a-fA-F]{64}', checksum[0]):
+                if checksum[0].lower() == digest:
+                    return MirrorResult(datadir, info, url, 'sha256')
+                mismatch = True
+        if mismatch:
+            raise ValueError('mirror SHA-256 does not match the downloaded index')
+        if existing_checksum:
+            raise ValueError('configured SHA-256 endpoint could not be verified')
+        # Kodi 21+ only loads directories for which it could read a checksum.
+        # Mirrors without a sidecar use the gzip itself as a legacy change marker.
+        return MirrorResult(datadir, info, info)
+    except (OSError, ValueError, EOFError, ET.ParseError, zlib.error) as error:
+        return MirrorResult(datadir, info, error=' '.join(str(error).split()))
+
+
+def adapt(addon, release, result):
+    previous = latest_directory(addon)
+    api = version_tuple(release.api)
+    latest = version_tuple(previous.attrib['maxversion'])
+    if result.error or api < latest:
+        return None
+    same_series = previous.findtext('datadir').rstrip('/') == result.datadir
+    if same_series:
+        checksum = previous.find('checksum')
+        if checksum.get('verify') and not result.verify:
+            return None
+        if (api == latest and previous.findtext('info') == result.info
+                and checksum.text == result.checksum and checksum.get('verify') == result.verify):
+            return None
+        entry = previous
+    else:
+        if api == latest:
+            raise ValueError(f'{addon.attrib["id"]}: {release.api} is already assigned to another series')
+        repo = addon.find(REPO_POINT)
+        entry = ET.SubElement(repo, 'dir', {'minversion': release.api})
+        for field in ('info', 'checksum', 'datadir', 'hashes'):
+            ET.SubElement(entry, field)
+        entry.find('hashes').text = 'false'
+
+    entry.set('maxversion', release.api)
+    entry.find('info').text = result.info
+    checksum = entry.find('checksum')
+    checksum.text = result.checksum
+    if result.verify:
+        checksum.set('verify', result.verify)
+    entry.find('datadir').text = result.datadir
+    major, minor, patch = version_tuple(addon.attrib['version'])
+    addon.set('version', f'{major}.{minor}.{patch + 1}')
+    ET.indent(addon, space='  ')
+    return ET.tostring(addon, encoding='utf-8', xml_declaration=True) + b'\n'
+
+
+def sync(root, release, *, dry_run=False):
+    addons = {path: parse_manifest(path, data) for path, data in load_manifests(root).items()}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        jobs = {}
+        for path, addon in addons.items():
+            datadir, info = mirror_urls(addon, release)
+            previous = latest_directory(addon)
+            current = previous.find('checksum')
+            existing_checksum = (current.text if current.get('verify') == 'sha256'
+                                 and previous.findtext('info') == info else None)
+            jobs[path] = pool.submit(probe_mirror, datadir, info, existing_checksum)
+        results = {path: job.result() for path, job in jobs.items()}
+
+    updates = {}
+    report = [f'### Kodi {release.tag} · Add-on API {release.api}', '']
+    for path, result in results.items():
+        manifest = adapt(addons[path], release, result)
+        if manifest is not None:
+            updates[path] = manifest
+        if result.error:
+            status = f'skipped ({result.error})'
+        else:
+            mode = 'verified SHA-256' if result.verify else 'legacy index change marker'
+            status = f'{"candidate update" if manifest is not None else "already configured"} ({mode})'
+        report.append(f'- `{path.parent.name}` — {status}')
+
+    summary = '\n'.join(report) + '\n'
+    print(summary, end='')
+    if summary_path := os.environ.get('GITHUB_STEP_SUMMARY'):
+        with Path(summary_path).open('a', encoding='utf-8') as stream:
+            stream.write(summary)
+    if all(result.error for result in results.values()):
+        raise ValueError(f'{release.tag}: no mirror served a usable index')
+    if updates and not dry_run:
+        build(root, updates=updates)
+    if output := os.environ.get('GITHUB_OUTPUT'):
+        with Path(output).open('a', encoding='utf-8') as stream:
+            stream.write(f'updated={str(bool(updates) and not dry_run).lower()}\n')
+    return updates
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dry-run', action='store_true', help='Probe mirrors without writing repository files')
+    args = parser.parse_args()
+    try:
+        release = fetch_latest_release(os.environ.get('GH_TOKEN'))
+        sync(ROOT, release, dry_run=args.dry_run)
+    except (OSError, ValueError, ET.ParseError) as error:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

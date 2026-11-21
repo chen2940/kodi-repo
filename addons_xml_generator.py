@@ -1,78 +1,172 @@
-#!/usr/bin/python
-""" addons.xml generator """
+#!/usr/bin/env python3
+"""Build and validate the Kodi repository index and versioned ZIPs."""
 
-# ref: https://blog.csdn.net/Mr_health/article/details/87953152
-# fix:
-# Excluding ../addon.xml for 'ascii' codec can't decode byte 0xe5 in position 606: ordinal not in range(128)
-import sys  
-from importlib import reload
+import argparse
+import hashlib
+import io
+from pathlib import Path
+import re
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 
-stdi, stdo, stde = sys.stdin, sys.stdout, sys.stderr
-reload(sys)
 
-sys.stdin, sys.stdout, sys.stderr = stdi, stdo, stde
+ROOT = Path(__file__).resolve().parent
+MIRROR_PREFIX = 'repository.kodi.mirror.'
 
 
-import os, hashlib
+def version_tuple(value):
+    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', value):
+        raise ValueError(f'Invalid version: {value!r}')
+    return tuple(map(int, value.split('.')))
 
-class Generator:
-    """
-        Generates a new addons.xml file from each addons addon.xml file.
-        Must be run from the root of the checked-out repo. Only handles
-        single depth folder structure.
-    """
-    def __init__( self ):
-        # generate file
-        self._generate_addons_file()
-        self._generate_md5_file()
 
-    def _generate_addons_file( self ):
-        # addon list
-        addons = sorted(os.listdir( "." ))
-        # final addons text
-        addons_xml = u"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<addons>\n"
-        # loop thru and add each addons addon.xml file
-        for addon in addons:
-            try:
-                # skip any file or .svn folder
-                if ( not os.path.isdir( addon ) or addon == ".git" ): continue
-                # create path
-                _path = os.path.join( addon, "addon.xml" )
-                # split lines for stripping
-                xml_lines = open( _path, "r" ).read().splitlines()
-                # new addon
-                addon_xml = ""
-                # loop thru cleaning each line
-                for line in xml_lines:
-                    # skip encoding format line
-                    if ( line.find( "<?xml" ) >= 0 ): continue
-                    # add line
-                    addon_xml += line.rstrip() + "\n"
-                # we succeeded so add to our final addons.xml text
-                addons_xml += addon_xml.rstrip() + "\n\n"
-            except Exception as e:
-                # missing or poorly formatted addon.xml
-                print("Excluding %s for %s" % ( _path, e, ))
-        # clean and add closing tag
-        addons_xml = addons_xml.strip() + u"\n</addons>\n"
-        # save file
-        self._save_addons_file( addons_xml )
+def parse_manifest(path, data):
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+    try:
+        addon = ET.fromstring(data, parser=parser)
+    except ET.ParseError as error:
+        raise ValueError(f'{path}: {error}') from error
+    if addon.tag != 'addon' or addon.get('id') != path.parent.name:
+        raise ValueError(f'{path}: add-on ID must match its directory')
+    version_tuple(addon.get('version', ''))
+    repo = addon.find("extension[@point='xbmc.addon.repository']")
+    dirs = repo.findall('dir') if repo is not None else []
+    if not dirs:
+        raise ValueError(f'{path}: missing repository directories')
+    ranges = []
+    for entry in dirs:
+        low = version_tuple(entry.get('minversion', ''))
+        high = version_tuple(entry.get('maxversion', ''))
+        if low > high:
+            raise ValueError(f'{path}: reversed version range {low} to {high}')
+        ranges.append((low, high))
+        for field in ('info', 'checksum', 'datadir'):
+            if not entry.findtext(field, '').startswith('https://'):
+                raise ValueError(f'{path}: missing HTTPS {field} URL')
+    ranges.sort()
+    if any(end >= start for (_, end), (start, _) in zip(ranges, ranges[1:])):
+        raise ValueError(f'{path}: overlapping Kodi API version ranges')
+    return addon
 
-    def _save_addons_file( self, addons_xml ):
-        try:
-            # write the bytestring to the file
-            open( "addons.xml", "w" ).write( addons_xml )
-        except Exception as e:
-            # oops
-            print("An error occurred saving file\n%s" % ( e, ))
 
-    def _generate_md5_file( self ):
-        try:
-            # write md5 file
-            open( "addons.xml.md5", "w" ).write( hashlib.md5(open('addons.xml','rb').read()).hexdigest() )
-        except Exception as e:
-            print("An error occured saving md5 file\n%s" % ( e, ))
+def load_manifests(root):
+    manifests = {}
+    for directory in sorted(root.glob(f'{MIRROR_PREFIX}*')):
+        if directory.is_dir():
+            path = directory / 'addon.xml'
+            manifests[path] = path.read_bytes()
+    if not manifests:
+        raise ValueError(f'{root}: no mirror manifests found')
+    return manifests
 
-if ( __name__ == "__main__" ):
-    # start
-    Generator()
+
+def make_zip(files):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as archive:
+        for name, data in files.items():
+            member = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            member.create_system = 3
+            member.external_attr = 0o100644 << 16
+            # Store the two small entries to produce identical bytes across zlib versions.
+            archive.writestr(member, data)
+    return output.getvalue()
+
+
+def check_zip(path, files):
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = sorted(entry.filename for entry in archive.infolist() if not entry.is_dir())
+            # Allow the optional root directory entry in older packages.
+            directories = [entry.filename for entry in archive.infolist() if entry.is_dir()]
+            root_entry = next(iter(files)).split('/')[0] + '/'
+            if names == sorted(files) and directories in ([], [root_entry]):
+                for name, source in files.items():
+                    packed = archive.read(name)
+                    if name.endswith('/addon.xml'):
+                        # Historical ZIPs may retain CRLF after a checkout normalizes the file.
+                        packed = packed.replace(b'\r\n', b'\n')
+                        source = source.replace(b'\r\n', b'\n')
+                    if packed != source:
+                        break
+                else:
+                    return
+    except (zipfile.BadZipFile, RuntimeError) as error:
+        raise ValueError(f'{path}: invalid ZIP ({error})') from error
+    raise ValueError(f'{path}: package differs from its sources, bump the add-on version')
+
+
+def write_atomic(path, data):
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temp:
+        pending = Path(temp.name)
+    try:
+        pending.write_bytes(data)
+        pending.chmod(0o644)
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def build(root, *, check=False, updates=None):
+    """Validate inputs before writing files and preserve existing versioned packages."""
+    manifests = load_manifests(root)
+    updates = updates or {}
+    if not updates.keys() <= manifests.keys():
+        raise ValueError('Updates must target an existing manifest')
+    entries = []
+    packages = {}
+    for path, original in manifests.items():
+        data = updates.get(path, original)
+        addon = parse_manifest(path, data)
+        text = data.decode('utf-8-sig')
+        if text.startswith('<?xml'):
+            text = text.partition('?>')[2]
+        entries.append('\n'.join(line.rstrip() for line in text.splitlines()).strip())
+        addon_id = addon.attrib['id']
+        version = addon.attrib['version']
+        icon = path.with_name('icon.png').read_bytes()
+        files = {f'{addon_id}/addon.xml': data, f'{addon_id}/icon.png': icon}
+        archive_path = path.parent / f'{addon_id}-{version}.zip'
+        if archive_path.exists():
+            check_zip(archive_path, files)
+        else:
+            packages[archive_path] = make_zip(files)
+
+    header = '<?xml version="1.0" encoding="UTF-8"?>\n<addons>\n'
+    xml = (header + '\n\n'.join(entries) + '\n</addons>\n').encode('utf-8')
+    try:
+        ET.fromstring(xml)
+    except ET.ParseError as error:
+        raise ValueError(f'Generated invalid addons.xml: {error}') from error
+    expected = {
+        **packages,
+        **updates,
+        root / 'addons.xml': xml,
+        root / 'addons.xml.md5': hashlib.md5(xml).hexdigest().encode('ascii'),
+    }
+    changed = [path for path, data in expected.items()
+               if not path.exists() or path.read_bytes() != data]
+    if check and changed:
+        raise ValueError('Regenerate missing or stale files: ' + ', '.join(
+            str(path.relative_to(root)) for path in changed))
+    for path in changed:
+        write_atomic(path, expected[path])
+    return changed
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='Validate without writing files')
+    args = parser.parse_args()
+    try:
+        changed = build(ROOT, check=args.check)
+    except (OSError, ValueError) as error:
+        print(error, file=sys.stderr)
+        return 1
+    print(f'Updated {len(changed)} repository files.' if changed else 'Repository files are current.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
