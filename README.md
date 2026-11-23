@@ -34,3 +34,7 @@ Windows 也可用 `py -3` 代替 `python`。不带 `--dry-run` 的同步命令�
 镜像提供匹配的 SHA-256 时，配置会启用该摘要验证。许多镜像只提供 `addons.xml.gz`，这种情况下继续以索引内容作为兼容的变更标记，让 Kodi 能加载仓库。遇到已配置的 SHA-256 验证失败时，同步会跳过该镜像。
 
 有变更时，工作流按频道上传包含新 ZIP 的补丁，并创建或更新 `automation/kodi-stable-sync` 或 `automation/kodi-preview-sync` 分支的 PR。要授权工作流开 PR，在 GitHub 仓库 **Settings → Actions → General → Workflow permissions** 中启用 **Allow GitHub Actions to create and approve pull requests**。手动运行时可以关闭 `open_pr`，只生成补丁；例如 `git apply --index kodi-preview-adaptation.patch`。
+
+## GitHub Releases 自动发版
+
+适配 PR 合并到默认分支后，`Publish Kodi mirror releases` 校验仓库，并按频道发布每个镜像当前版本的安装 ZIP。工作流按 ZIP 文件名和内容去重：同一组安装包只发布一次，修改文档或重跑不会发新版。标题标注该组安装包适配的最高 Kodi 版本，说明逐个列出 ZIP 对应的版本和 Add-on API。正式版标记为 Latest，测试版标记为 Pre-release，不会替代正式版。也可以在默认分支手动运行该工作流。

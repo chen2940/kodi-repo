@@ -26,6 +26,7 @@ from addons_xml_generator import PREVIEW_SUFFIX, ROOT, build, load_manifests, pa
 RELEASE_API = 'https://api.github.com/repos/xbmc/xbmc/releases/latest'
 RELEASE_LIST = 'https://api.github.com/repos/xbmc/xbmc/releases?per_page=100'
 RELEASE_TAG = re.compile(r'(?P<number>[0-9]+\.[0-9]+(?:\.[0-9]+)?)(?P<stage>(?:a|b|rc)[0-9]+)?-[A-Za-z0-9]+')
+PREVIEW_RELEASE_MARKER = 'kodi-release: '
 UPSTREAM_FILES = 'https://raw.githubusercontent.com/xbmc/xbmc'
 REPO_POINT = "extension[@point='xbmc.addon.repository']"
 INDEX_LIMIT = 8 * 1024 * 1024
@@ -251,16 +252,22 @@ def adapt_preview(stable, preview, release, result):
     entry = repo.find(f'dir[@minversion="{release.api}"]')
     if entry is not None:
         checksum = entry.find('checksum')
+        marker = next((child for child in entry if child.tag is ET.Comment
+                       and (child.text or '').startswith(PREVIEW_RELEASE_MARKER)), None)
         if checksum.get('verify') and not result.verify:
             return None
         if (entry.findtext('info'), checksum.text, checksum.get('verify'), entry.findtext('datadir')) == (
-                result.info, result.checksum, result.verify, result.datadir):
+                result.info, result.checksum, result.verify, result.datadir) and (
+                marker is None or marker.text == PREVIEW_RELEASE_MARKER + release.tag):
             return None
+        if marker is not None:
+            entry.remove(marker)
     else:
         entry = ET.SubElement(repo, 'dir', {'minversion': release.api, 'maxversion': release.api})
         for field in ('info', 'checksum', 'datadir', 'hashes'):
             ET.SubElement(entry, field)
         entry.find('hashes').text = 'false'
+    entry.insert(0, ET.Comment(PREVIEW_RELEASE_MARKER + release.tag))
     entry.find('info').text = result.info
     checksum = entry.find('checksum')
     checksum.text = result.checksum

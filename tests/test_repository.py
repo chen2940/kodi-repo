@@ -164,6 +164,7 @@ class RepositoryTests(unittest.TestCase):
             {'minversion': '21.90.901', 'maxversion': '21.90.901'},
             {'minversion': '21.90.902', 'maxversion': '21.90.902'},
         ])
+        self.assertIn(b'<!--kodi-release: 22.0rc2-Piers-->', manifest.read_bytes())
         self.assertEqual((self.root / 'addons.preview.xml.md5').read_text(),
                          hashlib.md5(preview_index.read_bytes()).hexdigest())
         self.assertEqual(builder.build(self.root, check=True), [])

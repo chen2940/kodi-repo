@@ -1,0 +1,31 @@
+name: Publish Kodi mirror releases
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kodi-mirror-releases
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+      - name: Validate and publish new ZIP snapshots
+        run: python publish_kodi_releases.py --repo "$GITHUB_REPOSITORY" --commit "$(git rev-parse HEAD)"
+        env:
+          GH_TOKEN: ${{ github.token }}
