@@ -1,0 +1,19 @@
+<?xml version='1.0' encoding='utf-8'?>
+<addon id="repository.kodi.mirror.thu.preview" name="Kodi Add-on Repository Chinese THU Mirrors (Preview)" version="1.0.0" provider-name="Snowdream Tech">
+  <extension point="xbmc.addon.repository">
+    <dir minversion="21.90.902" maxversion="21.90.902">
+      <info>https://mirrors.tuna.tsinghua.edu.cn/kodi/addons/piers/addons.xml.gz</info>
+      <checksum>https://mirrors.tuna.tsinghua.edu.cn/kodi/addons/piers/addons.xml.gz</checksum>
+      <datadir>https://mirrors.tuna.tsinghua.edu.cn/kodi/addons/piers</datadir>
+      <hashes>false</hashes>
+    </dir>
+  </extension>
+  <extension point="xbmc.addon.metadata">
+    <summary>Kodi prerelease add-ons via Kodi Add-on Repository Chinese THU Mirrors</summary>
+    <description>For the listed Kodi prerelease APIs only.</description>
+    <platform>all</platform>
+    <assets>
+      <icon>icon.png</icon>
+    </assets>
+  </extension>
+</addon>

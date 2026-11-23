@@ -14,6 +14,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent
 MIRROR_PREFIX = 'repository.kodi.mirror.'
+PREVIEW_SUFFIX = '.preview'
 
 
 def version_tuple(value):
@@ -51,13 +52,14 @@ def parse_manifest(path, data):
     return addon
 
 
-def load_manifests(root):
+def load_manifests(root, channel=None):
     manifests = {}
     for directory in sorted(root.glob(f'{MIRROR_PREFIX}*')):
-        if directory.is_dir():
+        is_preview = directory.name.endswith(PREVIEW_SUFFIX)
+        if directory.is_dir() and (channel is None or is_preview == (channel == 'preview')):
             path = directory / 'addon.xml'
             manifests[path] = path.read_bytes()
-    if not manifests:
+    if not manifests and channel != 'preview':
         raise ValueError(f'{root}: no mirror manifests found')
     return manifests
 
@@ -112,20 +114,28 @@ def build(root, *, check=False, updates=None):
     """Validate inputs before writing files and preserve existing versioned packages."""
     manifests = load_manifests(root)
     updates = updates or {}
-    if not updates.keys() <= manifests.keys():
-        raise ValueError('Updates must target an existing manifest')
-    entries = []
+    entries = {'stable': [], 'preview': []}
     packages = {}
-    for path, original in manifests.items():
-        data = updates.get(path, original)
+    icons = {}
+    for path, data in sorted((manifests | updates).items()):
+        preview = path.parent.name.endswith(PREVIEW_SUFFIX)
+        stable_id = path.parent.name.removesuffix(PREVIEW_SUFFIX)
+        stable_dir = root / stable_id
+        if path not in manifests and (not preview or path != root / (stable_id + PREVIEW_SUFFIX) / 'addon.xml'
+                                      or stable_dir / 'addon.xml' not in manifests):
+            raise ValueError(f'{path}: no corresponding stable mirror')
         addon = parse_manifest(path, data)
         text = data.decode('utf-8-sig')
         if text.startswith('<?xml'):
             text = text.partition('?>')[2]
-        entries.append('\n'.join(line.rstrip() for line in text.splitlines()).strip())
+        entries['preview' if preview else 'stable'].append(
+            '\n'.join(line.rstrip() for line in text.splitlines()).strip())
         addon_id = addon.attrib['id']
         version = addon.attrib['version']
-        icon = path.with_name('icon.png').read_bytes()
+        icon_path = path.with_name('icon.png')
+        if preview and path not in manifests and not icon_path.exists():
+            icons[icon_path] = (stable_dir / 'icon.png').read_bytes()
+        icon = icons[icon_path] if icon_path in icons else icon_path.read_bytes()
         files = {f'{addon_id}/addon.xml': data, f'{addon_id}/icon.png': icon}
         archive_path = path.parent / f'{addon_id}-{version}.zip'
         if archive_path.exists():
@@ -133,24 +143,26 @@ def build(root, *, check=False, updates=None):
         else:
             packages[archive_path] = make_zip(files)
 
-    header = '<?xml version="1.0" encoding="UTF-8"?>\n<addons>\n'
-    xml = (header + '\n\n'.join(entries) + '\n</addons>\n').encode('utf-8')
-    try:
-        ET.fromstring(xml)
-    except ET.ParseError as error:
-        raise ValueError(f'Generated invalid addons.xml: {error}') from error
-    expected = {
-        **packages,
-        **updates,
-        root / 'addons.xml': xml,
-        root / 'addons.xml.md5': hashlib.md5(xml).hexdigest().encode('ascii'),
-    }
+    expected = packages | icons | updates
+    for channel, name in (('stable', 'addons.xml'), ('preview', 'addons.preview.xml')):
+        path = root / name
+        if channel == 'preview' and not entries[channel] and not path.exists():
+            continue
+        header = '<?xml version="1.0" encoding="UTF-8"?>\n<addons>\n'
+        xml = (header + '\n\n'.join(entries[channel]) + '\n</addons>\n').encode('utf-8')
+        try:
+            ET.fromstring(xml)
+        except ET.ParseError as error:
+            raise ValueError(f'Generated invalid {name}: {error}') from error
+        expected[path] = xml
+        expected[root / (name + '.md5')] = hashlib.md5(xml).hexdigest().encode('ascii')
     changed = [path for path, data in expected.items()
                if not path.exists() or path.read_bytes() != data]
     if check and changed:
         raise ValueError('Regenerate missing or stale files: ' + ', '.join(
             str(path.relative_to(root)) for path in changed))
     for path in changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(path, expected[path])
     return changed
 

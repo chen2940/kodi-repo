@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon id="repository.kodi.mirror.cernet" name="Kodi Add-on Repository - CERNET MirrorZ" version="0.1.0" provider-name="chen2940">
+  <extension point="xbmc.addon.repository">
+    <dir minversion="21.0.0" maxversion="21.3.0">
+      <info>https://mirrors.cernet.edu.cn/kodi/addons/omega/addons.xml.gz</info>
+      <checksum>https://mirrors.cernet.edu.cn/kodi/addons/omega/addons.xml.gz</checksum>
+      <datadir>https://mirrors.cernet.edu.cn/kodi/addons/omega</datadir>
+      <hashes>false</hashes>
+    </dir>
+  </extension>
+  <extension point="xbmc.addon.metadata">
+    <summary>Kodi add-ons via the CERNET mirror redirector</summary>
+    <summary lang="zh">CERNET MirrorZ 联合镜像入口</summary>
+    <description>Uses the CERNET MirrorZ redirector to select a Kodi mirror.</description>
+    <platform>all</platform>
+    <assets><icon>icon.png</icon></assets>
+  </extension>
+</addon>

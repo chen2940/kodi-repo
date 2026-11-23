@@ -1,10 +1,19 @@
-name: Sync latest stable Kodi
+name: Sync Kodi mirrors
+run-name: Sync Kodi ${{ inputs.channel || (github.event.schedule == '37 1 * * 1' && 'preview' || 'stable') }} mirrors
 
 on:
   schedule:
-    - cron: '17 */6 * * *'
+    - cron: '17 1 1 * *'
+    - cron: '37 1 * * 1'
   workflow_dispatch:
     inputs:
+      channel:
+        description: Kodi release channel to sync
+        type: choice
+        options:
+          - stable
+          - preview
+        default: stable
       open_pr:
         description: Open or update the adaptation pull request
         type: boolean
@@ -15,7 +24,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: kodi-stable-sync
+  group: kodi-${{ inputs.channel || (github.event.schedule == '37 1 * * 1' && 'preview' || 'stable') }}-sync
   cancel-in-progress: false
 
 jobs:
@@ -23,6 +32,8 @@ jobs:
     if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      CHANNEL: ${{ inputs.channel || (github.event.schedule == '37 1 * * 1' && 'preview' || 'stable') }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -33,35 +44,37 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - name: Check Kodi release and update available mirrors
         id: kodi
-        run: python sync_kodi_release.py
+        run: python sync_kodi_release.py --channel "$CHANNEL"
         env:
           GH_TOKEN: ${{ github.token }}
       - run: python addons_xml_generator.py --check
       - name: Export adaptation patch
         if: steps.kodi.outputs.updated == 'true'
         run: |
-          git add -- addons.xml addons.xml.md5 repository.kodi.mirror.*
-          git diff --cached --binary > "$RUNNER_TEMP/kodi-adaptation.patch"
+          git add -- 'addons*.xml' 'addons*.xml.md5' 'repository.kodi.mirror.*'
+          git diff --cached --binary > "$RUNNER_TEMP/kodi-$CHANNEL-adaptation.patch"
       - name: Upload adaptation patch
         if: steps.kodi.outputs.updated == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: kodi-adaptation
-          path: ${{ runner.temp }}/kodi-adaptation.patch
+          name: kodi-${{ env.CHANNEL }}-adaptation
+          path: ${{ runner.temp }}/kodi-${{ env.CHANNEL }}-adaptation.patch
           if-no-files-found: error
           retention-days: 14
       - name: Open or update adaptation pull request
         if: steps.kodi.outputs.updated == 'true' && (github.event_name == 'schedule' || inputs.open_pr)
         uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8
         with:
-          branch: automation/kodi-stable-sync
+          branch: automation/kodi-${{ env.CHANNEL }}-sync
           delete-branch: true
           add-paths: |
             addons.xml
             addons.xml.md5
+            addons.preview.xml
+            addons.preview.xml.md5
             repository.kodi.mirror.*
-          commit-message: Adapt mirrors to the latest stable Kodi release
-          title: Adapt mirrors to the latest stable Kodi release
+          commit-message: Adapt mirrors to the latest Kodi ${{ env.CHANNEL }} release
+          title: Adapt mirrors to the latest Kodi ${{ env.CHANNEL }} release
           body: |
             Update the mirrors whose Kodi add-on indexes passed the live check.
             The workflow run summary records the release, API version, and per-mirror result.

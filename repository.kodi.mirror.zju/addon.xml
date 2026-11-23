@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon id="repository.kodi.mirror.zju" name="Kodi Add-on Repository - ZJU Mirror" version="0.1.0" provider-name="chen2940">
+  <extension point="xbmc.addon.repository">
+    <dir minversion="21.0.0" maxversion="21.3.0">
+      <info>https://mirrors.zju.edu.cn/kodi/addons/omega/addons.xml.gz</info>
+      <checksum>https://mirrors.zju.edu.cn/kodi/addons/omega/addons.xml.gz</checksum>
+      <datadir>https://mirrors.zju.edu.cn/kodi/addons/omega</datadir>
+      <hashes>false</hashes>
+    </dir>
+  </extension>
+  <extension point="xbmc.addon.metadata">
+    <summary>Kodi add-ons via the Zhejiang University mirror</summary>
+    <summary lang="zh">浙江大学 Kodi 官方插件库镜像</summary>
+    <description>Installs Kodi add-ons from the Zhejiang University open-source mirror.</description>
+    <platform>all</platform>
+    <assets><icon>icon.png</icon></assets>
+  </extension>
+</addon>

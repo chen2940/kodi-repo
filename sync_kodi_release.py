@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapt the mirror manifests to the latest stable Kodi release."""
+"""Adapt Kodi mirror manifests for the stable or preview channel."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -20,10 +20,12 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 import xml.etree.ElementTree as ET
 import zlib
 
-from addons_xml_generator import ROOT, build, load_manifests, parse_manifest, version_tuple
+from addons_xml_generator import PREVIEW_SUFFIX, ROOT, build, load_manifests, parse_manifest, version_tuple
 
 
 RELEASE_API = 'https://api.github.com/repos/xbmc/xbmc/releases/latest'
+RELEASE_LIST = 'https://api.github.com/repos/xbmc/xbmc/releases?per_page=100'
+RELEASE_TAG = re.compile(r'(?P<number>[0-9]+\.[0-9]+(?:\.[0-9]+)?)(?P<stage>(?:a|b|rc)[0-9]+)?-[A-Za-z0-9]+')
 UPSTREAM_FILES = 'https://raw.githubusercontent.com/xbmc/xbmc'
 REPO_POINT = "extension[@point='xbmc.addon.repository']"
 INDEX_LIMIT = 8 * 1024 * 1024
@@ -69,22 +71,51 @@ class Release:
     index_name: str
 
 
-def fetch_latest_release(token=None):
+def release_json(url, token):
     headers = {'Accept': 'application/vnd.github+json'}
     if token:
         headers['Authorization'] = f'Bearer {token}'
     try:
-        release_data = download(RELEASE_API, 512 * 1024, headers=headers)
+        release_data = download(url, 4 * 1024 * 1024, headers=headers)
     except HTTPError as error:
         if not token or error.code not in (401, 403, 404):
             raise
         headers.pop('Authorization')
-        release_data = download(RELEASE_API, 512 * 1024, headers=headers)
-    release = json.loads(release_data)
+        release_data = download(url, 4 * 1024 * 1024, headers=headers)
+    return json.loads(release_data)
+
+
+def release_key(tag):
+    match = RELEASE_TAG.fullmatch(tag)
+    if match is None:
+        return None
+    parts = tuple(map(int, match['number'].split('.')))
+    stage = match['stage']
+    if stage is None:
+        return parts + (0,) * (3 - len(parts)), (3, 0)
+    prefix = stage.rstrip('0123456789')
+    return parts + (0,) * (3 - len(parts)), (('a', 'b', 'rc').index(prefix), int(stage[len(prefix):]))
+
+
+def fetch_latest_release(token=None, *, channel='stable'):
+    release = release_json(RELEASE_API, token)
     tag = release.get('tag_name', '')
+    stable_key = release_key(tag)
     if (release.get('draft') is not False or release.get('prerelease') is not False
-            or not re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?-[A-Za-z0-9]+', tag)):
+            or stable_key is None or stable_key[1] != (3, 0)):
         raise ValueError(f'Unexpected stable Kodi release: {tag!r}')
+    if channel == 'preview':
+        candidates = []
+        for entry in release_json(RELEASE_LIST, token):
+            if entry.get('draft') is not False or entry.get('prerelease') is not True:
+                continue
+            candidate = entry.get('tag_name', '')
+            key = release_key(candidate)
+            if key is not None and key[0] > stable_key[0] and key[1] != (3, 0):
+                candidates.append((key, candidate))
+        if not candidates:
+            return None
+        _, tag = max(candidates)
     upstream = f'{UPSTREAM_FILES}/{quote(tag, safe="")}'
     version_txt = download(f'{upstream}/version.txt', 32 * 1024).decode('utf-8')
     api_line = re.search(r'^ADDON_API[ \t]+([^\s]+)[ \t]*\r?$', version_txt, re.MULTILINE)
@@ -195,13 +226,69 @@ def adapt(addon, release, result):
     return ET.tostring(addon, encoding='utf-8', xml_declaration=True) + b'\n'
 
 
-def sync(root, release, *, dry_run=False):
-    addons = {path: parse_manifest(path, data) for path, data in load_manifests(root).items()}
+def adapt_preview(stable, preview, release, result):
+    if result.error:
+        return None
+    if preview is None:
+        mirror_name = stable.get('name', stable.attrib['id'])
+        addon = ET.Element('addon', {
+            'id': stable.attrib['id'] + PREVIEW_SUFFIX,
+            'name': mirror_name + ' (Preview)', 'version': '1.0.0',
+            'provider-name': stable.get('provider-name', mirror_name),
+        })
+        repo = ET.SubElement(addon, 'extension', {'point': 'xbmc.addon.repository'})
+        metadata = ET.SubElement(addon, 'extension', {'point': 'xbmc.addon.metadata'})
+        ET.SubElement(metadata, 'summary').text = 'Kodi prerelease add-ons via ' + mirror_name
+        ET.SubElement(metadata, 'description').text = 'For the listed Kodi prerelease APIs only.'
+        ET.SubElement(metadata, 'platform').text = 'all'
+        ET.SubElement(ET.SubElement(metadata, 'assets'), 'icon').text = 'icon.png'
+    else:
+        addon = preview
+        repo = addon.find(REPO_POINT)
+        if version_tuple(release.api) < version_tuple(latest_directory(addon).attrib['maxversion']):
+            return None
+
+    entry = repo.find(f'dir[@minversion="{release.api}"]')
+    if entry is not None:
+        checksum = entry.find('checksum')
+        if checksum.get('verify') and not result.verify:
+            return None
+        if (entry.findtext('info'), checksum.text, checksum.get('verify'), entry.findtext('datadir')) == (
+                result.info, result.checksum, result.verify, result.datadir):
+            return None
+    else:
+        entry = ET.SubElement(repo, 'dir', {'minversion': release.api, 'maxversion': release.api})
+        for field in ('info', 'checksum', 'datadir', 'hashes'):
+            ET.SubElement(entry, field)
+        entry.find('hashes').text = 'false'
+    entry.find('info').text = result.info
+    checksum = entry.find('checksum')
+    checksum.text = result.checksum
+    if result.verify:
+        checksum.set('verify', result.verify)
+    entry.find('datadir').text = result.datadir
+    if preview is not None:
+        major, minor, patch = version_tuple(addon.attrib['version'])
+        addon.set('version', f'{major}.{minor}.{patch + 1}')
+    ET.indent(addon, space='  ')
+    return ET.tostring(addon, encoding='utf-8', xml_declaration=True) + b'\n'
+
+
+def sync(root, release, *, dry_run=False, channel='stable'):
+    addons = {path: parse_manifest(path, data) for path, data in load_manifests(root, 'stable').items()}
+    previews = ({path: parse_manifest(path, data) for path, data in load_manifests(root, 'preview').items()}
+                if channel == 'preview' else {})
+
+    def target_path(path):
+        if channel == 'preview':
+            return root / (path.parent.name + PREVIEW_SUFFIX) / 'addon.xml'
+        return path
+
     with ThreadPoolExecutor(max_workers=8) as pool:
         jobs = {}
         for path, addon in addons.items():
             datadir, info = mirror_urls(addon, release)
-            previous = latest_directory(addon)
+            previous = latest_directory(previews.get(target_path(path), addon))
             current = previous.find('checksum')
             existing_checksum = (current.text if current.get('verify') == 'sha256'
                                  and previous.findtext('info') == info else None)
@@ -209,17 +296,21 @@ def sync(root, release, *, dry_run=False):
         results = {path: job.result() for path, job in jobs.items()}
 
     updates = {}
-    report = [f'### Kodi {release.tag} · Add-on API {release.api}', '']
+    report = [f'### Kodi {release.tag} · {channel} · Add-on API {release.api}', '']
     for path, result in results.items():
-        manifest = adapt(addons[path], release, result)
+        target = target_path(path)
+        if channel == 'preview':
+            manifest = adapt_preview(addons[path], previews.get(target), release, result)
+        else:
+            manifest = adapt(addons[path], release, result)
         if manifest is not None:
-            updates[path] = manifest
+            updates[target] = manifest
         if result.error:
             status = f'skipped ({result.error})'
         else:
             mode = 'verified SHA-256' if result.verify else 'legacy index change marker'
             status = f'{"candidate update" if manifest is not None else "already configured"} ({mode})'
-        report.append(f'- `{path.parent.name}` — {status}')
+        report.append(f'- `{target.parent.name}` — {status}')
 
     summary = '\n'.join(report) + '\n'
     print(summary, end='')
@@ -238,11 +329,15 @@ def sync(root, release, *, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--channel', choices=('stable', 'preview'), default='stable')
     parser.add_argument('--dry-run', action='store_true', help='Probe mirrors without writing repository files')
     args = parser.parse_args()
     try:
-        release = fetch_latest_release(os.environ.get('GH_TOKEN'))
-        sync(ROOT, release, dry_run=args.dry_run)
+        release = fetch_latest_release(os.environ.get('GH_TOKEN'), channel=args.channel)
+        if release is None:
+            print('No active Kodi prerelease newer than the current stable release.')
+            return 0
+        sync(ROOT, release, dry_run=args.dry_run, channel=args.channel)
     except (OSError, ValueError, ET.ParseError) as error:
         print(error, file=sys.stderr)
         return 1

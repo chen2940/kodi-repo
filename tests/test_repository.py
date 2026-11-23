@@ -130,6 +130,44 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(len(dirs), 1)
         self.assertEqual(dirs[0].attrib, {'minversion': '21.0.0', 'maxversion': '21.4.0'})
 
+    def test_preview_creates_separate_packages_and_exact_api_entries(self):
+        builder.build(self.root)
+        stable_index = (self.root / 'addons.xml').read_bytes()
+        stable_zip = self.package('0.1.4').read_bytes()
+        first = sync.Release('22.0rc1-Piers', '21.90.901', 'piers', 'addons.xml.gz')
+        second = sync.Release('22.0rc2-Piers', '21.90.902', 'piers', 'addons.xml.gz')
+
+        def probe(datadir, info, existing_checksum):
+            return sync.MirrorResult(datadir, info, info)
+
+        preview_id = ADDON_ID + '.preview'
+        manifest = self.root / preview_id / 'addon.xml'
+        preview_zip = manifest.parent / f'{preview_id}-1.0.0.zip'
+        with patch.object(sync, 'probe_mirror', side_effect=probe), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIn(manifest, sync.sync(self.root, first, dry_run=True, channel='preview'))
+            self.assertFalse(manifest.parent.exists())
+            self.assertIn(manifest, sync.sync(self.root, first, channel='preview'))
+            initial_zip = preview_zip.read_bytes()
+            self.assertIn(manifest, sync.sync(self.root, second, channel='preview'))
+            self.assertEqual(sync.sync(self.root, second, channel='preview'), {})
+            stable_patch = sync.Release('21.4-Omega', '21.4.0', 'omega', 'addons.xml.gz')
+            self.assertEqual(list(sync.sync(self.root, stable_patch, dry_run=True)), [self.manifest])
+
+        self.assertEqual((self.root / 'addons.xml').read_bytes(), stable_index)
+        self.assertEqual(self.package('0.1.4').read_bytes(), stable_zip)
+        self.assertEqual(preview_zip.read_bytes(), initial_zip)
+        preview_index = self.root / 'addons.preview.xml'
+        addon, = ET.parse(preview_index).getroot()
+        self.assertEqual(addon.get('id'), preview_id)
+        self.assertEqual(addon.get('version'), '1.0.1')
+        self.assertEqual([entry.attrib for entry in addon.findall(f'{sync.REPO_POINT}/dir')], [
+            {'minversion': '21.90.901', 'maxversion': '21.90.901'},
+            {'minversion': '21.90.902', 'maxversion': '21.90.902'},
+        ])
+        self.assertEqual((self.root / 'addons.preview.xml.md5').read_text(),
+                         hashlib.md5(preview_index.read_bytes()).hexdigest())
+        self.assertEqual(builder.build(self.root, check=True), [])
+
 
 class UpstreamTests(unittest.TestCase):
     def test_latest_release_reads_api_and_repository_from_tag(self):
@@ -149,6 +187,27 @@ class UpstreamTests(unittest.TestCase):
         with patch.object(sync, 'download', return_value=json.dumps(meta).encode()):
             with self.assertRaisesRegex(ValueError, 'Unexpected stable Kodi release'):
                 sync.fetch_latest_release()
+
+    def test_preview_ignores_claimed_newest_date_and_stale_or_draft_releases(self):
+        stable = {'tag_name': '21.3-Omega', 'prerelease': False, 'draft': False}
+        entries = [{'tag_name': tag, 'prerelease': True, 'draft': False} for tag in (
+            '22.0b3-Piers', '21.3rc7-Omega', '22.0rc2-Piers', '22.0rc1-Piers', '22.0a10-Piers')]
+        entries.append({'tag_name': '23.0a1-Next', 'prerelease': True, 'draft': True})
+        repo = b'''<addon><extension point="xbmc.addon.repository"><dir>
+          <info>https://mirrors.kodi.tv/addons/piers/addons.xml.gz</info>
+          <datadir>https://mirrors.kodi.tv/addons/piers</datadir>
+          </dir></extension></addon>'''
+        data = [json.dumps(stable).encode(), json.dumps(entries).encode(), b'ADDON_API 21.90.902\n', repo]
+        with patch.object(sync, 'download', side_effect=data) as download:
+            self.assertEqual(sync.fetch_latest_release(channel='preview'),
+                             sync.Release('22.0rc2-Piers', '21.90.902', 'piers', 'addons.xml.gz'))
+        self.assertIn('22.0rc2-Piers', download.call_args_list[2].args[0])
+
+    def test_preview_noops_after_prerelease_graduates_to_stable(self):
+        stable = {'tag_name': '22.0-Piers', 'prerelease': False, 'draft': False}
+        old = [{'tag_name': '22.0rc2-Piers', 'prerelease': True, 'draft': False}]
+        with patch.object(sync, 'download', side_effect=[json.dumps(stable).encode(), json.dumps(old).encode()]):
+            self.assertIsNone(sync.fetch_latest_release(channel='preview'))
 
 
 class MirrorTests(unittest.TestCase):
